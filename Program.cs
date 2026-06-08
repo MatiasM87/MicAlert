@@ -104,6 +104,11 @@ public sealed class MicAlertContext : ApplicationContext
             onTestShow: () => ShowIndicator("Prueba desde UI"),
             onTestHide: () => HideIndicator("Prueba desde UI"));
 
+        // Pause polling while settings are open: UIA scans run on the UI thread
+        // and block it for hundreds of ms, making the form unresponsive.
+        _timer.Stop();
+        _settingsForm.FormClosed += (_, _) => _timer.Start();
+
         _settingsForm.Show();
         _settingsForm.Activate();
     }
