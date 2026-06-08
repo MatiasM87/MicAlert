@@ -23,6 +23,7 @@ internal static class Program
 
 public sealed class MicAlertContext : ApplicationContext
 {
+    private const string StartupMessage = "MicAlert iniciado.";
     private readonly NotifyIcon _tray;
     private readonly System.Windows.Forms.Timer _timer;
     private readonly List<IndicatorForm> _forms = new();
@@ -56,7 +57,7 @@ public sealed class MicAlertContext : ApplicationContext
         _timer.Tick += (_, _) => Tick();
         _timer.Start();
 
-        Log("MicAlert iniciado.");
+        Log(StartupMessage);
         Tick();
     }
 
@@ -122,6 +123,8 @@ public sealed class MicAlertContext : ApplicationContext
         _lastReason = "";
 
         var screens = GetTargetScreens(_config);
+        if (!screens.Any())
+            Log("ERROR: sin pantallas disponibles, indicador desactivado.");
         foreach (var screen in screens)
         {
             var f = new IndicatorForm();
@@ -206,7 +209,7 @@ public sealed class MicAlertContext : ApplicationContext
 
     private void Log(string message)
     {
-        if (!_config.Debug && !message.StartsWith("ERROR") && message != "MicAlert iniciado.") return;
+        if (!_config.Debug && !message.StartsWith("ERROR") && message != StartupMessage) return;
         try
         {
             File.AppendAllText(_logPath, $"{DateTime.Now:yyyy-MM-dd HH:mm:ss.fff} {message}{Environment.NewLine}");
@@ -505,18 +508,32 @@ public static class ZoomMuteDetector
 
     private static string GetCachedProcessName(int pid)
     {
-        if (DateTime.UtcNow - _procCacheTime > TimeSpan.FromSeconds(5))
+        var now = DateTime.UtcNow;
+        if (now - _procCacheTime > TimeSpan.FromSeconds(5))
         {
             _procCache.Clear();
-            _procCacheTime = DateTime.UtcNow;
+            _procCacheTime = now;
         }
-        if (!_procCache.TryGetValue(pid, out var name))
-        {
-            try { name = Normalize(Process.GetProcessById(pid).ProcessName); } catch { name = ""; }
+        if (_procCache.TryGetValue(pid, out var cached))
+            return cached;
+
+        string name;
+        try { name = Normalize(Process.GetProcessById(pid).ProcessName); } catch { name = ""; }
+        // Only cache zoom-related names. Non-zoom PIDs are not cached so if Zoom starts on a
+        // recently-recycled PID it is detected on the very next tick rather than after the TTL.
+        if (name.Contains("zoom") || name.Contains("cpt") || name.Contains("zcef"))
             _procCache[pid] = name;
-        }
         return name;
     }
+
+    // Hoisted to avoid per-tick COM-interop allocation; includes Custom/SplitButton for Zoom 6.x+ toolbar.
+    private static readonly Condition _buttonCondition = new OrCondition(
+        new PropertyCondition(AutomationElement.ControlTypeProperty, ControlType.Button),
+        new PropertyCondition(AutomationElement.ControlTypeProperty, ControlType.MenuItem),
+        new PropertyCondition(AutomationElement.ControlTypeProperty, ControlType.ToolBar),
+        new PropertyCondition(AutomationElement.ControlTypeProperty, ControlType.Custom),
+        new PropertyCondition(AutomationElement.ControlTypeProperty, ControlType.SplitButton)
+    );
 
     private static readonly string[] MutedTerms =
     {
@@ -549,12 +566,7 @@ public static class ZoomMuteDetector
                 string winName = SafeName(win);
                 scanned++;
 
-                var buttonCondition = new OrCondition(
-                    new PropertyCondition(AutomationElement.ControlTypeProperty, ControlType.Button),
-                    new PropertyCondition(AutomationElement.ControlTypeProperty, ControlType.MenuItem),
-                    new PropertyCondition(AutomationElement.ControlTypeProperty, ControlType.ToolBar)
-                );
-                var elements = win.FindAll(TreeScope.Descendants, buttonCondition);
+                var elements = win.FindAll(TreeScope.Descendants, _buttonCondition);
                 foreach (AutomationElement el in elements)
                 {
                     var text = BuildText(el);
@@ -638,6 +650,9 @@ public static class WindowsMicDetector
 {
     private const string MicRoot = @"Software\Microsoft\Windows\CurrentVersion\CapabilityAccessManager\ConsentStore\microphone";
 
+    // Registry.GetValue returns long for REG_QWORD and int for REG_DWORD; handle both.
+    private static long? ToLong(object? v) => v switch { long l => l, int i => (long)i, _ => null };
+
     public static bool IsMicrophoneInUse(out string reason)
     {
         reason = "no activo";
@@ -666,14 +681,16 @@ public static class WindowsMicDetector
     private static IEnumerable<string> Walk(RegistryKey key, string path)
     {
         object? stop = null;
-        object? start = null;
         try { stop = key.GetValue("LastUsedTimeStop"); } catch { }
-        try { start = key.GetValue("LastUsedTimeStart"); } catch { }
-        // Mic in use: start timestamp is set and stop timestamp is still 0 (not yet written).
-        // Requiring start != 0 avoids false positives from stale zero-stop keys left by crashed apps
-        // that never actually opened the microphone in this session.
-        if (stop is long stopVal && stopVal == 0L && start is long startVal && startVal != 0L)
-            yield return path;
+        // Short-circuit: only read start when stop is already 0 (possible active use).
+        // Requiring start != 0 avoids false positives from stale zero-stop keys left by crashed apps.
+        if (ToLong(stop) == 0L)
+        {
+            object? start = null;
+            try { start = key.GetValue("LastUsedTimeStart"); } catch { }
+            if (ToLong(start) is long startLong && startLong != 0L)
+                yield return path;
+        }
 
         string[] names;
         try { names = key.GetSubKeyNames(); } catch { yield break; }
