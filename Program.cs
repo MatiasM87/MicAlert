@@ -85,14 +85,24 @@ public sealed class MicAlertContext : ApplicationContext
             return;
         }
 
-        _settingsForm = new SettingsForm(_config.Clone(), cfg =>
-        {
-            _config = cfg;
-            _config.Save(_configPath);
-            ApplyConfig();
-            Log("Config guardada desde UI.");
-            Tick();
-        }, () => ShowIndicator("Prueba desde UI"), () => HideIndicator("Prueba desde UI"));
+        _settingsForm = new SettingsForm(_config.Clone(),
+            onSave: cfg =>
+            {
+                _config = cfg;
+                if (!_config.Save(_configPath))
+                    Log("ERROR: no se pudo guardar config en " + _configPath);
+                ApplyConfig();
+                Log("Config guardada desde UI.");
+                Tick();
+            },
+            onPreview: cfg =>
+            {
+                _config = cfg;
+                ApplyConfig();
+                Tick();
+            },
+            onTestShow: () => ShowIndicator("Prueba desde UI"),
+            onTestHide: () => HideIndicator("Prueba desde UI"));
 
         _settingsForm.Show();
         _settingsForm.Activate();
@@ -291,6 +301,7 @@ public sealed class SettingsForm : Form
 {
     private readonly AppConfig _config;
     private readonly Action<AppConfig> _onSave;
+    private readonly Action<AppConfig> _onPreview;
     private readonly Action _onTestShow;
     private readonly Action _onTestHide;
 
@@ -307,10 +318,11 @@ public sealed class SettingsForm : Form
     private readonly CheckBox _debug;
     private readonly Panel _preview;
 
-    public SettingsForm(AppConfig config, Action<AppConfig> onSave, Action onTestShow, Action onTestHide)
+    public SettingsForm(AppConfig config, Action<AppConfig> onSave, Action<AppConfig> onPreview, Action onTestShow, Action onTestHide)
     {
         _config = config;
         _onSave = onSave;
+        _onPreview = onPreview;
         _onTestShow = onTestShow;
         _onTestHide = onTestHide;
 
@@ -375,7 +387,7 @@ public sealed class SettingsForm : Form
         var testHide = new Button { Text = "Ocultar", Width = 80 };
         save.Click += (_, _) => Save();
         cancel.Click += (_, _) => Close();
-        testShow.Click += (_, _) => { Save(); _onTestShow(); };
+        testShow.Click += (_, _) => { Preview(); _onTestShow(); };
         testHide.Click += (_, _) => _onTestHide();
         buttons.Controls.Add(save);
         buttons.Controls.Add(cancel);
@@ -399,7 +411,7 @@ public sealed class SettingsForm : Form
         }
     }
 
-    private void Save()
+    private void CollectFormValues()
     {
         _config.Mode = _mode.Text;
         _config.Size = (int)_size.Value;
@@ -412,6 +424,19 @@ public sealed class SettingsForm : Form
         _config.Opacity = (double)_opacity.Value / 100.0;
         _config.FallbackToWindowsMicInUse = _fallback.Checked;
         _config.Debug = _debug.Checked;
+    }
+
+    // Applies current form values to the running indicator without writing to disk.
+    private void Preview()
+    {
+        CollectFormValues();
+        _onPreview(_config.Clone());
+    }
+
+    // Applies current form values and persists them to config.json.
+    private void Save()
+    {
+        CollectFormValues();
         _onSave(_config.Clone());
     }
 
@@ -472,9 +497,14 @@ public sealed class AppConfig
         }
     }
 
-    public void Save(string path)
+    public bool Save(string path)
     {
-        File.WriteAllText(path, JsonSerializer.Serialize(this, new JsonSerializerOptions { WriteIndented = true }));
+        try
+        {
+            File.WriteAllText(path, JsonSerializer.Serialize(this, new JsonSerializerOptions { WriteIndented = true }));
+            return true;
+        }
+        catch { return false; }
     }
 
     public AppConfig Clone()
@@ -518,7 +548,7 @@ public static class ZoomMuteDetector
             return cached;
 
         string name;
-        try { name = Normalize(Process.GetProcessById(pid).ProcessName); } catch { name = ""; }
+        try { using var p = Process.GetProcessById(pid); name = Normalize(p.ProcessName); } catch { name = ""; }
         // Only cache zoom-related names. Non-zoom PIDs are not cached so if Zoom starts on a
         // recently-recycled PID it is detected on the very next tick rather than after the TTL.
         if (name.Contains("zoom") || name.Contains("cpt") || name.Contains("zcef"))
@@ -526,11 +556,10 @@ public static class ZoomMuteDetector
         return name;
     }
 
-    // Hoisted to avoid per-tick COM-interop allocation; includes Custom/SplitButton for Zoom 6.x+ toolbar.
+    // Hoisted to avoid per-tick COM-interop allocation; ToolBar removed — its child buttons are returned separately.
     private static readonly Condition _buttonCondition = new OrCondition(
         new PropertyCondition(AutomationElement.ControlTypeProperty, ControlType.Button),
         new PropertyCondition(AutomationElement.ControlTypeProperty, ControlType.MenuItem),
-        new PropertyCondition(AutomationElement.ControlTypeProperty, ControlType.ToolBar),
         new PropertyCondition(AutomationElement.ControlTypeProperty, ControlType.Custom),
         new PropertyCondition(AutomationElement.ControlTypeProperty, ControlType.SplitButton)
     );
@@ -542,8 +571,18 @@ public static class ZoomMuteDetector
 
     private static readonly string[] UnmutedTerms =
     {
-        "silenciar", "silenciar audio", "mute", "mute audio", "mute my audio"
+        "silenciar", "silenciar audio", "mute audio", "mute my audio"
     };
+
+    // Word-boundary-aware substring match: prevents "mute" matching inside "unmute", "MuteButton", etc.
+    private static bool ContainsTerm(string normalized, string term)
+    {
+        var idx = normalized.IndexOf(term, StringComparison.Ordinal);
+        if (idx < 0) return false;
+        var beforeOk = idx == 0 || !char.IsLetterOrDigit(normalized[idx - 1]);
+        var afterOk  = idx + term.Length >= normalized.Length || !char.IsLetterOrDigit(normalized[idx + term.Length]);
+        return beforeOk && afterOk;
+    }
 
     public static bool? IsZoomUnmuted(out string reason, bool debug)
     {
@@ -573,14 +612,14 @@ public static class ZoomMuteDetector
                     if (string.IsNullOrWhiteSpace(text)) continue;
                     var n = Normalize(text);
 
-                    if (MutedTerms.Any(t => n.Contains(t)))
+                    if (MutedTerms.Any(t => ContainsTerm(n, t)))
                     {
                         foundMuted = true;
                         mutedHit = text;
                         break;
                     }
 
-                    if (!foundUnmuted && UnmutedTerms.Any(t => n.Contains(t)))
+                    if (!foundUnmuted && UnmutedTerms.Any(t => ContainsTerm(n, t)))
                     {
                         foundUnmuted = true;
                         unmutedHit = text;
