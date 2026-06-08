@@ -118,6 +118,8 @@ public sealed class MicAlertContext : ApplicationContext
             try { form.Hide(); form.Dispose(); } catch { }
         }
         _forms.Clear();
+        _lastVisible = false;
+        _lastReason = "";
 
         var screens = GetTargetScreens(_config);
         foreach (var screen in screens)
@@ -132,7 +134,8 @@ public sealed class MicAlertContext : ApplicationContext
     {
         var mode = (cfg.MonitorMode ?? "primary").Trim().ToLowerInvariant();
         if (mode == "all" || mode == "todos") return Screen.AllScreens;
-        return new[] { Screen.PrimaryScreen ?? Screen.AllScreens.First() };
+        var primary = Screen.PrimaryScreen ?? Screen.AllScreens.FirstOrDefault();
+        return primary != null ? new[] { primary } : Array.Empty<Screen>();
     }
 
     private void Tick()
@@ -203,7 +206,7 @@ public sealed class MicAlertContext : ApplicationContext
 
     private void Log(string message)
     {
-        if (!_config.Debug && !message.StartsWith("ERROR") && !message.Contains("iniciado")) return;
+        if (!_config.Debug && !message.StartsWith("ERROR") && message != "MicAlert iniciado.") return;
         try
         {
             File.AppendAllText(_logPath, $"{DateTime.Now:yyyy-MM-dd HH:mm:ss.fff} {message}{Environment.NewLine}");
@@ -214,6 +217,7 @@ public sealed class MicAlertContext : ApplicationContext
     protected override void ExitThreadCore()
     {
         _timer.Stop();
+        _timer.Dispose();
         _tray.Visible = false;
         _tray.Dispose();
         foreach (var form in _forms) form.Dispose();
@@ -444,7 +448,7 @@ public sealed class AppConfig
     public string Color { get; set; } = "red";
     public double Opacity { get; set; } = 1.0;
     public bool FallbackToWindowsMicInUse { get; set; } = false;
-    public bool Debug { get; set; } = true;
+    public bool Debug { get; set; } = false;
 
     public static AppConfig Load(string path)
     {
@@ -496,6 +500,24 @@ public readonly record struct MicState(bool Show, string Reason);
 
 public static class ZoomMuteDetector
 {
+    private static readonly Dictionary<int, string> _procCache = new();
+    private static DateTime _procCacheTime = DateTime.MinValue;
+
+    private static string GetCachedProcessName(int pid)
+    {
+        if (DateTime.UtcNow - _procCacheTime > TimeSpan.FromSeconds(5))
+        {
+            _procCache.Clear();
+            _procCacheTime = DateTime.UtcNow;
+        }
+        if (!_procCache.TryGetValue(pid, out var name))
+        {
+            try { name = Normalize(Process.GetProcessById(pid).ProcessName); } catch { name = ""; }
+            _procCache[pid] = name;
+        }
+        return name;
+    }
+
     private static readonly string[] MutedTerms =
     {
         "reactivar audio", "activar audio", "unmute", "unmute audio", "join audio", "conectar audio"
@@ -527,20 +549,26 @@ public static class ZoomMuteDetector
                 string winName = SafeName(win);
                 scanned++;
 
-                var elements = win.FindAll(TreeScope.Descendants, Condition.TrueCondition);
+                var buttonCondition = new OrCondition(
+                    new PropertyCondition(AutomationElement.ControlTypeProperty, ControlType.Button),
+                    new PropertyCondition(AutomationElement.ControlTypeProperty, ControlType.MenuItem),
+                    new PropertyCondition(AutomationElement.ControlTypeProperty, ControlType.ToolBar)
+                );
+                var elements = win.FindAll(TreeScope.Descendants, buttonCondition);
                 foreach (AutomationElement el in elements)
                 {
                     var text = BuildText(el);
                     if (string.IsNullOrWhiteSpace(text)) continue;
                     var n = Normalize(text);
 
-                    if (!foundMuted && MutedTerms.Any(t => n.Contains(t)))
+                    if (MutedTerms.Any(t => n.Contains(t)))
                     {
                         foundMuted = true;
                         mutedHit = text;
+                        break;
                     }
 
-                    if (!foundUnmuted && UnmutedTerms.Any(t => n.Contains(t)) && !MutedTerms.Any(t => n.Contains(t)))
+                    if (!foundUnmuted && UnmutedTerms.Any(t => n.Contains(t)))
                     {
                         foundUnmuted = true;
                         unmutedHit = text;
@@ -577,8 +605,7 @@ public static class ZoomMuteDetector
             var name = Normalize(SafeName(win));
             var cls = Normalize(SafeClass(win));
             var pid = win.Current.ProcessId;
-            string proc = "";
-            try { proc = Normalize(Process.GetProcessById(pid).ProcessName); } catch { }
+            var proc = GetCachedProcessName(pid);
 
             return name.Contains("zoom") || cls.Contains("zoom") || proc.Contains("zoom") || proc.Contains("cpt") || proc.Contains("zcef");
         }
@@ -639,8 +666,13 @@ public static class WindowsMicDetector
     private static IEnumerable<string> Walk(RegistryKey key, string path)
     {
         object? stop = null;
+        object? start = null;
         try { stop = key.GetValue("LastUsedTimeStop"); } catch { }
-        if (stop != null && stop.ToString() == "0")
+        try { start = key.GetValue("LastUsedTimeStart"); } catch { }
+        // Mic in use: start timestamp is set and stop timestamp is still 0 (not yet written).
+        // Requiring start != 0 avoids false positives from stale zero-stop keys left by crashed apps
+        // that never actually opened the microphone in this session.
+        if (stop is long stopVal && stopVal == 0L && start is long startVal && startVal != 0L)
             yield return path;
 
         string[] names;
