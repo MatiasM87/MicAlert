@@ -1,0 +1,13 @@
+{
+  "mode": "zoom",
+  "size": 14,
+  "position": "top-right",
+  "monitorMode": "primary",
+  "offsetX": 12,
+  "offsetY": 12,
+  "pollMs": 500,
+  "color": "red",
+  "opacity": 1.0,
+  "fallbackToWindowsMicInUse": false,
+  "debug": true
+}

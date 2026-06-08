@@ -1,0 +1,112 @@
+name: Build & Release
+
+on:
+  push:
+    branches: [main]
+    tags:
+      - "v*.*.*"
+  pull_request:
+    branches: [main]
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    name: Build Windows Executable
+    runs-on: windows-latest
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup .NET 8
+        uses: actions/setup-dotnet@v4
+        with:
+          dotnet-version: "8.0.x"
+
+      - name: Restore dependencies
+        run: dotnet restore
+
+      - name: Build
+        run: dotnet build -c Release --no-restore
+
+      - name: Publish single-file exe
+        run: |
+          dotnet publish -c Release -r win-x64 --self-contained `
+            -p:PublishSingleFile=true `
+            -p:IncludeNativeLibrariesForSelfExtract=true `
+            -p:EnableCompressionInSingleFile=true `
+            -o publish
+
+      - name: Copy config
+        run: Copy-Item config.json publish\config.json -Force
+
+      - name: Upload build artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: MicAlert-win-x64
+          path: |
+            publish/MicAlert.exe
+            publish/config.json
+          retention-days: 30
+
+  release:
+    name: Create GitHub Release
+    needs: build
+    runs-on: windows-latest
+    if: startsWith(github.ref, 'refs/tags/v')
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup .NET 8
+        uses: actions/setup-dotnet@v4
+        with:
+          dotnet-version: "8.0.x"
+
+      - name: Restore dependencies
+        run: dotnet restore
+
+      - name: Publish single-file exe
+        run: |
+          dotnet publish -c Release -r win-x64 --self-contained `
+            -p:PublishSingleFile=true `
+            -p:IncludeNativeLibrariesForSelfExtract=true `
+            -p:EnableCompressionInSingleFile=true `
+            -o publish
+
+      - name: Copy config
+        run: Copy-Item config.json publish\config.json -Force
+
+      - name: Create zip archive
+        run: |
+          Compress-Archive -Path publish\MicAlert.exe, publish\config.json `
+            -DestinationPath MicAlert-${{ github.ref_name }}-win-x64.zip
+
+      - name: Create GitHub Release
+        uses: softprops/action-gh-release@v2
+        with:
+          name: MicAlert ${{ github.ref_name }}
+          body: |
+            ## MicAlert ${{ github.ref_name }}
+
+            ### Download
+            Download **MicAlert.exe** below — no installation required, just run it.
+
+            > **Requirements:** Windows 10/11 × 64-bit
+
+            ### What's in the zip
+            - `MicAlert.exe` — self-contained executable (no .NET install needed)
+            - `config.json` — default configuration file
+
+            ### How to use
+            1. Extract the zip
+            2. Run `MicAlert.exe`
+            3. The app appears in your system tray
+            4. Double-click the tray icon to configure
+          files: |
+            MicAlert-${{ github.ref_name }}-win-x64.zip
+          draft: false
+          prerelease: false
