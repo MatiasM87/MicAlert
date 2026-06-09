@@ -27,9 +27,13 @@ public sealed class MicAlertContext : ApplicationContext
     private readonly NotifyIcon _tray;
     private readonly System.Windows.Forms.Timer _timer;
     private readonly List<IndicatorForm> _forms = new();
+    // Hidden control used only to marshal background-scan results back to the UI thread.
+    private readonly Control _sync = new();
     private AppConfig _config;
     private bool _lastVisible;
     private string _lastReason = "";
+    private volatile bool _scanInProgress;
+    private volatile bool _exiting;
     private readonly string _baseDir;
     private readonly string _configPath;
     private readonly string _logPath;
@@ -42,6 +46,7 @@ public sealed class MicAlertContext : ApplicationContext
         _logPath = Path.Combine(_baseDir, "micalert-debug.log");
         _config = AppConfig.Load(_configPath);
 
+        _sync.CreateControl();
         RebuildIndicatorForms();
 
         _tray = new NotifyIcon
@@ -137,8 +142,8 @@ public sealed class MicAlertContext : ApplicationContext
         _lastVisible = false;
         _lastReason = "";
 
-        var screens = GetTargetScreens(_config);
-        if (!screens.Any())
+        var screens = GetTargetScreens(_config).ToArray();
+        if (screens.Length == 0)
             Log("ERROR: sin pantallas disponibles, indicador desactivado.");
         foreach (var screen in screens)
         {
@@ -156,24 +161,55 @@ public sealed class MicAlertContext : ApplicationContext
         return primary != null ? new[] { primary } : Array.Empty<Screen>();
     }
 
+    // Detection (UIA scan / registry walk) is slow, so it runs on a background
+    // thread; only the show/hide result is marshaled back to the UI thread.
+    // The _scanInProgress guard prevents scans from piling up when one takes
+    // longer than the poll interval.
     private void Tick()
     {
-        try
+        if (_scanInProgress || _exiting) return;
+        _scanInProgress = true;
+        var cfg = _config;
+        System.Threading.Tasks.Task.Run(() =>
         {
-            var result = ShouldShowIndicator();
-            if (result.Show) ShowIndicator(result.Reason);
-            else HideIndicator(result.Reason);
-        }
-        catch (Exception ex)
-        {
-            Log("ERROR Tick: " + ex.Message);
-            HideIndicator("Error: " + ex.Message);
-        }
+            MicState result;
+            try
+            {
+                result = ShouldShowIndicator(cfg);
+            }
+            catch (Exception ex)
+            {
+                Log("ERROR Tick: " + ex.Message);
+                result = new MicState(false, "Error: " + ex.Message);
+            }
+
+            try
+            {
+                if (!_exiting && _sync.IsHandleCreated)
+                {
+                    _sync.BeginInvoke(() =>
+                    {
+                        _scanInProgress = false;
+                        if (_exiting) return;
+                        if (result.Show) ShowIndicator(result.Reason);
+                        else HideIndicator(result.Reason);
+                    });
+                }
+                else
+                {
+                    _scanInProgress = false;
+                }
+            }
+            catch
+            {
+                _scanInProgress = false;
+            }
+        });
     }
 
-    private MicState ShouldShowIndicator()
+    private MicState ShouldShowIndicator(AppConfig cfg)
     {
-        var mode = (_config.Mode ?? "zoom").Trim().ToLowerInvariant();
+        var mode = (cfg.Mode ?? "zoom").Trim().ToLowerInvariant();
 
         if (mode == "windows")
         {
@@ -181,11 +217,11 @@ public sealed class MicAlertContext : ApplicationContext
             return new MicState(win, "Windows: " + windowsReason);
         }
 
-        var zoom = ZoomMuteDetector.IsZoomUnmuted(out var zoomReason, _config.Debug);
+        var zoom = ZoomMuteDetector.IsZoomUnmuted(out var zoomReason, cfg.Debug);
         if (zoom.HasValue)
             return new MicState(zoom.Value, "Zoom: " + zoomReason);
 
-        if (_config.FallbackToWindowsMicInUse)
+        if (cfg.FallbackToWindowsMicInUse)
         {
             var win = WindowsMicDetector.IsMicrophoneInUse(out var winReason);
             return new MicState(win, "Zoom sin estado claro; fallback Windows: " + winReason);
@@ -234,12 +270,14 @@ public sealed class MicAlertContext : ApplicationContext
 
     protected override void ExitThreadCore()
     {
+        _exiting = true;
         _timer.Stop();
         _timer.Dispose();
         _tray.Visible = false;
         _tray.Dispose();
         foreach (var form in _forms) form.Dispose();
         _settingsForm?.Dispose();
+        _sync.Dispose();
         base.ExitThreadCore();
     }
 }
@@ -265,8 +303,9 @@ public sealed class IndicatorForm : Form
             const int WS_EX_TOOLWINDOW = 0x00000080;
             const int WS_EX_NOACTIVATE = 0x08000000;
             const int WS_EX_TOPMOST = 0x00000008;
+            const int WS_EX_TRANSPARENT = 0x00000020; // click-through: el punto no roba clicks del mouse
             var cp = base.CreateParams;
-            cp.ExStyle |= WS_EX_TOOLWINDOW | WS_EX_NOACTIVATE | WS_EX_TOPMOST;
+            cp.ExStyle |= WS_EX_TOOLWINDOW | WS_EX_NOACTIVATE | WS_EX_TOPMOST | WS_EX_TRANSPARENT;
             return cp;
         }
     }
@@ -561,6 +600,37 @@ public static class ZoomMuteDetector
         return name;
     }
 
+    // Property caches: without these, every property read (Name, HelpText, etc.) is a
+    // separate cross-process COM call. With a CacheRequest active, FindAll fetches all
+    // requested properties in a single batch, cutting scan time dramatically.
+    private static readonly CacheRequest _windowCache = BuildWindowCache();
+    private static readonly CacheRequest _elementCache = BuildElementCache();
+
+    private static CacheRequest BuildWindowCache()
+    {
+        var cr = new CacheRequest();
+        cr.Add(AutomationElement.NameProperty);
+        cr.Add(AutomationElement.ClassNameProperty);
+        cr.Add(AutomationElement.ProcessIdProperty);
+        // Full mode: we still need a live reference to call FindAll on the window.
+        cr.AutomationElementMode = AutomationElementMode.Full;
+        return cr;
+    }
+
+    private static CacheRequest BuildElementCache()
+    {
+        var cr = new CacheRequest();
+        cr.Add(AutomationElement.NameProperty);
+        cr.Add(AutomationElement.HelpTextProperty);
+        cr.Add(AutomationElement.AutomationIdProperty);
+        cr.Add(AutomationElement.ClassNameProperty);
+        cr.Add(AutomationElement.LocalizedControlTypeProperty);
+        // None: descendants are read-only; skipping the live reference avoids one
+        // cross-process handle per element.
+        cr.AutomationElementMode = AutomationElementMode.None;
+        return cr;
+    }
+
     // Hoisted to avoid per-tick COM-interop allocation; ToolBar removed — its child buttons are returned separately.
     private static readonly Condition _buttonCondition = new OrCondition(
         new PropertyCondition(AutomationElement.ControlTypeProperty, ControlType.Button),
@@ -600,8 +670,9 @@ public static class ZoomMuteDetector
 
         try
         {
-            var root = AutomationElement.RootElement;
-            var windows = root.FindAll(TreeScope.Children, Condition.TrueCondition);
+            AutomationElementCollection windows;
+            using (_windowCache.Activate())
+                windows = AutomationElement.RootElement.FindAll(TreeScope.Children, Condition.TrueCondition);
 
             foreach (AutomationElement win in windows)
             {
@@ -610,7 +681,9 @@ public static class ZoomMuteDetector
                 string winName = SafeName(win);
                 scanned++;
 
-                var elements = win.FindAll(TreeScope.Descendants, _buttonCondition);
+                AutomationElementCollection elements;
+                using (_elementCache.Activate())
+                    elements = win.FindAll(TreeScope.Descendants, _buttonCondition);
                 foreach (AutomationElement el in elements)
                 {
                     var text = BuildText(el);
@@ -660,7 +733,7 @@ public static class ZoomMuteDetector
         {
             var name = Normalize(SafeName(win));
             var cls = Normalize(SafeClass(win));
-            var pid = win.Current.ProcessId;
+            var pid = win.Cached.ProcessId;
             var proc = GetCachedProcessName(pid);
 
             return name.Contains("zoom") || cls.Contains("zoom") || proc.Contains("zoom") || proc.Contains("cpt") || proc.Contains("zcef");
@@ -672,7 +745,7 @@ public static class ZoomMuteDetector
     {
         try
         {
-            var p = el.Current;
+            var p = el.Cached;
             return string.Join(" | ", new[]
             {
                 p.Name,
@@ -685,8 +758,8 @@ public static class ZoomMuteDetector
         catch { return ""; }
     }
 
-    private static string SafeName(AutomationElement el) { try { return el.Current.Name ?? ""; } catch { return ""; } }
-    private static string SafeClass(AutomationElement el) { try { return el.Current.ClassName ?? ""; } catch { return ""; } }
+    private static string SafeName(AutomationElement el) { try { return el.Cached.Name ?? ""; } catch { return ""; } }
+    private static string SafeClass(AutomationElement el) { try { return el.Cached.ClassName ?? ""; } catch { return ""; } }
     private static string Normalize(string s) => (s ?? "").Trim().ToLowerInvariant();
 }
 
